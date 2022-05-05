@@ -28,81 +28,6 @@ class SQLConnectionError(Exception):
     pass
 
 
-# we're only including the bare minimum set of special characters required to parse the connection string while
-# supporting escaping using braces, letting the client library or the database ultimately decide what's valid
-CONNECTION_STRING_SPECIAL_CHARACTERS = set('=;{}')
-
-
-def parse_connection_string_properties(cs):
-    """
-    Parses the properties portion of a SQL Server connection string (i.e. "key1=value1;key2=value2;...") into a map of
-    {key -> value}. The string must contain *properties only*, meaning the subprotocol, serverName, instanceName and
-    portNumber are not included in the string.
-    See https://docs.microsoft.com/en-us/sql/connect/jdbc/building-the-connection-url
-    """
-    cs = cs.strip()
-    params = {}
-    i = 0
-    escaping = False
-    key, parsed, key_done = "", "", False
-    while i < len(cs):
-        if escaping:
-            if cs[i : i + 2] == '}}':
-                parsed += '}'
-                i += 2
-                continue
-            if cs[i] == '}':
-                escaping = False
-                i += 1
-                continue
-            parsed += cs[i]
-            i += 1
-            continue
-        if cs[i] == '{':
-            escaping = True
-            i += 1
-            continue
-        # ignore leading whitespace, i.e. between two keys "A=B;  C=D"
-        if not key_done and not parsed and cs[i] == ' ':
-            i += 1
-            continue
-        if cs[i] == '=':
-            if key_done:
-                raise ConfigurationError(
-                    "Invalid connection string: unexpected '=' while parsing value at index={}: {}".format(i, cs)
-                )
-            key, parsed, key_done = parsed, "", True
-            if not key:
-                raise ConfigurationError("Invalid connection string: empty key at index={}: {}".format(i, cs))
-            i += 1
-            continue
-        if cs[i] == ';':
-            if not parsed:
-                raise ConfigurationError("Invalid connection string: empty value at index={}: {}".format(i, cs))
-            params[key] = parsed
-            key, parsed, key_done = "", "", False
-            i += 1
-            continue
-        if cs[i] in CONNECTION_STRING_SPECIAL_CHARACTERS:
-            raise ConfigurationError(
-                "Invalid connection string: invalid character '{}' at index={}: {}".format(cs[i], i, cs)
-            )
-        parsed += cs[i]
-        i += 1
-    # the last ';' can be omitted so check for a final remaining param here
-    if escaping:
-        raise ConfigurationError(
-            "Invalid connection string: did not find expected matching closing brace '}}': {}".format(cs)
-        )
-    if key:
-        if not parsed:
-            raise ConfigurationError(
-                "Invalid connection string: empty value at the end of the connection string: {}".format(cs)
-            )
-        params[key] = parsed
-    return params
-
-
 class Connection(object):
     """Manages the connection to a SQL Server instance."""
 
@@ -112,7 +37,7 @@ class Connection(object):
     DEFAULT_DB_KEY = 'database'
     PROC_GUARD_DB_KEY = 'proc_only_if_database'
 
-    valid_adoproviders = ['SQLOLEDB', 'MSOLEDBSQL', 'SQLNCLI11']
+    valid_adoproviders = ['SQLOLEDB', 'MSOLEDBSQL', 'MSOLEDBSQL19', 'SQLNCLI11']
     default_adoprovider = 'SQLOLEDB'
 
     def __init__(self, init_config, instance_config, service_check_handler):
@@ -142,6 +67,10 @@ class Connection(object):
 
         self.adoprovider = init_config.get('adoprovider', self.default_adoprovider)
         if self.adoprovider.upper() not in self.valid_adoproviders:
+            # try to query the host the agent is running on for valid drivers
+            try:
+                host_drivers = pyodbc.drivers()
+            except
             self.log.error(
                 "Invalid ADODB provider string %s, defaulting to %s", self.adoprovider, self.default_adoprovider
             )
@@ -410,20 +339,18 @@ class Connection(object):
         if cs is None:
             return
 
-        parsed_cs = parse_connection_string_properties(cs)
-        lowercased_keys_cs = {k.lower(): v for k, v in parsed_cs.items()}
-
-        if lowercased_keys_cs.get('trusted_connection', "false").lower() in {'yes', 'true'} and (username or password):
+        if 'Trusted_Connection=yes' in cs and (username or password):
             self.log.warning("Username and password are ignored when using Windows authentication")
+        cs = cs.upper()
 
         for key, value in connector_options.items():
-            if key.lower() in lowercased_keys_cs and self.instance.get(value) is not None:
+            if key.upper() in cs and self.instance.get(value) is not None:
                 raise ConfigurationError(
                     "%s has been provided both in the connection string and as a "
                     "configuration option (%s), please specify it only once" % (key, value)
                 )
         for key in other_connector_options.keys():
-            if key.lower() in lowercased_keys_cs:
+            if key.upper() in cs:
                 raise ConfigurationError(
                     "%s has been provided in the connection string. "
                     "This option is only available for %s connections,"
@@ -437,6 +364,9 @@ class Connection(object):
         else:
             dsn, host, username, password, database, driver = self._get_access_info(db_key, db_name)
 
+        # TODO: The connection resiliency feature is supported on Microsoft Azure SQL Database and SQL Server 2014 (and later) server versions.
+        # https://docs.microsoft.com/en-us/sql/connect/odbc/connection-resiliency?view=sql-server-ver15
+        # need to check version, and not set this is younger than 2014
         conn_str = 'ConnectRetryCount=2;'
         if dsn:
             conn_str += 'DSN={};'.format(dsn)
@@ -463,7 +393,12 @@ class Connection(object):
             _, host, username, password, database, _ = self._get_access_info(db_key, db_name)
 
         provider = self._get_adoprovider()
-        conn_str = 'ConnectRetryCount=2;Provider={};Data Source={};Initial Catalog={};'.format(provider, host, database)
+        retry_conn_count = ''
+        # TODO: only append if its the correct version
+        # needs to be implemented
+        if version >= "2014":
+            retry_conn_count = 'ConnectRetryCount=2;'
+        conn_str = '{}Provider={};Data Source={};Initial Catalog={};'.format(retry_conn_count, provider, host, database)
 
         if username:
             conn_str += 'User ID={};'.format(username)
